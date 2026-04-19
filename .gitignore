@@ -1,0 +1,7 @@
+/vendor/
+/app_config.php
+/.env
+/.env.*
+/composer.phar
+/php_errors.log
+*.log
