@@ -1,6 +1,12 @@
 <?php
 
 return [
+    'database' => [
+        'host' => 'localhost',
+        'user' => 'root',
+        'password' => '',
+        'name' => 'dawa_alert'
+    ],
     'app' => [
         'base_url' => 'http://localhost/dawa_alert'
     ],

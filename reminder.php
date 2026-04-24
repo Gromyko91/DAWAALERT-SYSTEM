@@ -1,11 +1,25 @@
 <?php
 require 'db.php';
-$config = require __DIR__ . '/app_config.php';
+$config_path = __DIR__ . '/app_config.php';
+
+if(!file_exists($config_path)){
+    echo "Missing app_config.php. Copy app_config.example.php to app_config.php and add Africa's Talking sandbox credentials.\n";
+    $conn->close();
+    exit();
+}
+
+$config = require $config_path;
 
 // Africa's Talking sandbox credentials
 $at_username = $config['africastalking']['username'];
 $at_api_key = $config['africastalking']['api_key'];
 $at_sms_endpoint = $config['africastalking']['sms_endpoint'];
+
+if(trim($at_api_key) === '' || $at_api_key === 'your-africas-talking-api-key'){
+    echo "Africa's Talking sandbox API key is not configured in app_config.php.\n";
+    $conn->close();
+    exit();
+}
 
 function sendAfricaTalkingSms($phone, $message, $username, $api_key, $endpoint){
     $payload = http_build_query([
@@ -48,9 +62,69 @@ function sendAfricaTalkingSms($phone, $message, $username, $api_key, $endpoint){
     ];
 }
 
+function upsertDailyReminderLog($conn, $medication_id, $patient_id, $log_date, $status, $alert_sent, $timestamp){
+    $check = $conn->prepare("
+        SELECT id
+        FROM reminder_logs
+        WHERE medication_id = ? AND log_date = ?
+        ORDER BY id DESC
+        LIMIT 1
+    ");
+    $check->bind_param("is", $medication_id, $log_date);
+    $check->execute();
+    $existing = $check->get_result()->fetch_assoc();
+    $check->close();
+
+    if($existing){
+        $update = $conn->prepare("
+            UPDATE reminder_logs
+            SET reminder_sent_at = ?, alert_sent = ?, status = ?
+            WHERE id = ?
+        ");
+        $update->bind_param("sisi", $timestamp, $alert_sent, $status, $existing['id']);
+        $update->execute();
+        $update->close();
+        return;
+    }
+
+    $insert = $conn->prepare("
+        INSERT INTO reminder_logs (medication_id, patient_id, reminder_sent_at, log_date, alert_sent, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ");
+    $insert->bind_param("iissis", $medication_id, $patient_id, $timestamp, $log_date, $alert_sent, $status);
+    $insert->execute();
+    $insert->close();
+}
+
 // Current time
+$today = date('Y-m-d');
 $now = date('H:i:s');
 $now_datetime = date('Y-m-d H:i:s');
+$missed_grace_seconds = 15 * 60;
+
+$missed_update = $conn->prepare("
+    UPDATE medications
+    SET status='missed', status_date=?
+    WHERE ? BETWEEN monitoring_start AND monitoring_end
+      AND (status_date IS NULL OR status_date <> ? OR status='pending')
+      AND TIME_TO_SEC(TIMEDIFF(?, time)) > ?
+");
+$missed_update->bind_param("ssssi", $today, $today, $today, $now, $missed_grace_seconds);
+$missed_update->execute();
+$missed_update->close();
+
+$missed_result = $conn->prepare("
+    SELECT id, patient_id
+    FROM medications
+    WHERE status='missed' AND status_date=?
+");
+$missed_result->bind_param("s", $today);
+$missed_result->execute();
+$missed_rows = $missed_result->get_result();
+while($missed_row = $missed_rows->fetch_assoc()){
+    upsertDailyReminderLog($conn, (int)$missed_row['id'], (int)$missed_row['patient_id'], $today, 'missed', 1, $now_datetime);
+}
+$missed_result->close();
 
 // 2️⃣ Handle incoming SMS replies in the format 1-1234 or 2-1234
 $incoming_reply = null;
@@ -93,8 +167,8 @@ if($incoming_reply !== null && $incoming_phone !== null){
             $status = ($reply_action === "1") ? "taken" : "missed";
 
             // Update medication status
-            $upd = $conn->prepare("UPDATE medications SET status=? WHERE id=?");
-            $upd->bind_param("si", $status, $med['id']);
+            $upd = $conn->prepare("UPDATE medications SET status=?, status_date=? WHERE id=?");
+            $upd->bind_param("ssi", $status, $today, $med['id']);
             $upd->execute();
             $upd->close();
 
@@ -103,13 +177,9 @@ if($incoming_reply !== null && $incoming_phone !== null){
                 echo "Caregiver ({$med['caregiver_phone']}) notified: Patient missed {$med['medicine_name']}\n";
             }
 
-            // Log update
-            $log = $conn->prepare("INSERT INTO reminder_logs (medication_id, patient_id, reminder_sent_at, alert_sent, status) VALUES (?, ?, ?, ?, ?)");
             $alert_sent = ($status=='missed') ? 1 : 0;
             $now_datetime = date('Y-m-d H:i:s');
-            $log->bind_param("iisis", $med['id'], $med['patient_id'], $now_datetime, $alert_sent, $status);
-            $log->execute();
-            $log->close();
+            upsertDailyReminderLog($conn, (int)$med['id'], (int)$med['patient_id'], $today, $status, $alert_sent, $now_datetime);
 
             echo "Reply processed for medication {$med['id']} with status $status\n";
         } else {
@@ -129,10 +199,11 @@ $stmt = $conn->prepare("
            p.name AS patient_name, p.phone AS patient_phone, p.caregiver_phone
     FROM medications m
     JOIN patients p ON m.patient_id = p.id
-    WHERE m.status='pending'
+    WHERE ? BETWEEN m.monitoring_start AND m.monitoring_end
+      AND (m.status_date IS NULL OR m.status_date <> ? OR m.status='pending')
       AND TIME_TO_SEC(TIMEDIFF(?, m.time)) BETWEEN 0 AND 3600
 ");
-$stmt->bind_param("s", $now);
+$stmt->bind_param("sss", $today, $today, $now);
 $stmt->execute();
 $result = $stmt->get_result();
 
@@ -163,12 +234,12 @@ while($row = $result->fetch_assoc()){
         echo "Error: " . ($sms_result['error'] ?: 'Africa\'s Talking rejected the request') . "\n";
     }
 
-    // Log the reminder
-    $log = $conn->prepare("INSERT INTO reminder_logs (medication_id, patient_id, reminder_sent_at, alert_sent, status) VALUES (?, ?, ?, 0, ?)");
-    $status = $row['status'];
-    $log->bind_param("iiss", $med_id, $row['patient_id'], $now_datetime, $status);
-    $log->execute();
-    $log->close();
+    $mark_pending = $conn->prepare("UPDATE medications SET status='pending', status_date=? WHERE id=?");
+    $mark_pending->bind_param("si", $today, $med_id);
+    $mark_pending->execute();
+    $mark_pending->close();
+
+    upsertDailyReminderLog($conn, (int)$med_id, (int)$row['patient_id'], $today, 'pending', 0, $now_datetime);
 }
 
 $stmt->close();

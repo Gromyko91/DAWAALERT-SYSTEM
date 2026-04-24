@@ -13,33 +13,83 @@ $flash_message = $_SESSION['flash_message'] ?? '';
 $flash_type = $_SESSION['flash_type'] ?? 'success';
 unset($_SESSION['flash_message'], $_SESSION['flash_type']);
 
-$conn->query("
-    CREATE TABLE IF NOT EXISTS medicines (
-        id INT(11) NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(255) NOT NULL UNIQUE,
-        category VARCHAR(100) DEFAULT 'General',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-");
+function upsertDailyReminderLog($conn, $medication_id, $patient_id, $log_date, $status, $alert_sent, $timestamp){
+    $check = $conn->prepare("
+        SELECT id
+        FROM reminder_logs
+        WHERE medication_id = ? AND log_date = ?
+        ORDER BY id DESC
+        LIMIT 1
+    ");
+    $check->bind_param("is", $medication_id, $log_date);
+    $check->execute();
+    $existing = $check->get_result()->fetch_assoc();
+    $check->close();
 
-$column_check = $conn->query("SHOW COLUMNS FROM medicines LIKE 'category'");
-if($column_check && $column_check->num_rows === 0){
-    $conn->query("ALTER TABLE medicines ADD COLUMN category VARCHAR(100) DEFAULT 'General' AFTER name");
+    if($existing){
+        $update = $conn->prepare("
+            UPDATE reminder_logs
+            SET reminder_sent_at = ?, alert_sent = ?, status = ?
+            WHERE id = ?
+        ");
+        $update->bind_param("sisi", $timestamp, $alert_sent, $status, $existing['id']);
+        $update->execute();
+        $update->close();
+        return;
+    }
+
+    $insert = $conn->prepare("
+        INSERT INTO reminder_logs (medication_id, patient_id, reminder_sent_at, log_date, alert_sent, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ");
+    $insert->bind_param("iissis", $medication_id, $patient_id, $timestamp, $log_date, $alert_sent, $status);
+    $insert->execute();
+    $insert->close();
 }
 
-$conn->query("
-    INSERT IGNORE INTO medicines (name)
-    SELECT DISTINCT medicine_name
-    FROM medications
-    WHERE medicine_name IS NOT NULL AND medicine_name <> ''
-");
+function syncOverdueMedicationStatuses($conn, $doctor_id){
+    $today = date('Y-m-d');
+    $now = date('H:i:s');
+    $now_datetime = date('Y-m-d H:i:s');
+    $missed_grace_seconds = 15 * 60;
+
+    $sync = $conn->prepare("
+        SELECT m.id, m.patient_id
+        FROM medications m
+        JOIN patients p ON m.patient_id = p.id
+        WHERE p.doctor_id = ?
+          AND ? BETWEEN m.monitoring_start AND m.monitoring_end
+          AND TIME_TO_SEC(TIMEDIFF(?, m.time)) > ?
+          AND (m.status_date IS NULL OR m.status_date <> ? OR m.status = 'pending')
+    ");
+    $sync->bind_param("issis", $doctor_id, $today, $now, $missed_grace_seconds, $today);
+    $sync->execute();
+    $rows = $sync->get_result();
+
+    while($row = $rows->fetch_assoc()){
+        $update = $conn->prepare("UPDATE medications SET status='missed', status_date=? WHERE id=?");
+        $update->bind_param("si", $today, $row['id']);
+        $update->execute();
+        $update->close();
+
+        upsertDailyReminderLog($conn, (int)$row['id'], (int)$row['patient_id'], $today, 'missed', 1, $now_datetime);
+    }
+
+    $sync->close();
+}
 
 function fetchAdherenceData($conn, $doctor_id){
     $adherence = [];
-    $result = $conn->query("SELECT m.status, p.name AS patient_name
-    FROM medications m
-    JOIN patients p ON m.patient_id=p.id
-    WHERE p.doctor_id=$doctor_id");
+    $today = date('Y-m-d');
+    $result = $conn->query("SELECT rl.status, p.name AS patient_name
+    FROM reminder_logs rl
+    JOIN medications m ON rl.medication_id = m.id
+    JOIN patients p ON rl.patient_id = p.id
+    WHERE p.doctor_id=$doctor_id
+      AND rl.log_date IS NOT NULL
+      AND rl.log_date BETWEEN m.monitoring_start AND m.monitoring_end
+      AND rl.log_date <= '$today'
+      AND rl.status IN ('taken', 'missed')");
 
     if($result){
         while($row = $result->fetch_assoc()){
@@ -55,8 +105,6 @@ function fetchAdherenceData($conn, $doctor_id){
                 ];
             }
 
-            $adherence[$patient_name]['total']++;
-
             if($row['status'] === 'taken'){
                 $adherence[$patient_name]['taken']++;
             }
@@ -64,6 +112,8 @@ function fetchAdherenceData($conn, $doctor_id){
             if($row['status'] === 'missed'){
                 $adherence[$patient_name]['missed']++;
             }
+
+            $adherence[$patient_name]['total'] = $adherence[$patient_name]['taken'] + $adherence[$patient_name]['missed'];
         }
     }
 
@@ -78,10 +128,17 @@ function fetchAdherenceData($conn, $doctor_id){
 
 function fetchTimelineData($conn, $doctor_id){
     $timeline = [];
-    $result = $conn->query("SELECT m.*, p.name AS patient_name
+    $today = date('Y-m-d');
+    $result = $conn->query("SELECT m.*,
+        CASE
+            WHEN m.status_date = '$today' THEN m.status
+            ELSE 'pending'
+        END AS daily_status,
+        p.name AS patient_name
     FROM medications m
     JOIN patients p ON m.patient_id=p.id
     WHERE p.doctor_id=$doctor_id
+      AND '$today' BETWEEN m.monitoring_start AND m.monitoring_end
     ORDER BY p.name ASC, m.time ASC");
 
     if($result){
@@ -110,7 +167,9 @@ function fetchTimelineData($conn, $doctor_id){
                 'medicine_name' => $row['medicine_name'],
                 'dosage' => $row['dosage'],
                 'time' => $row['time'],
-                'status' => $row['status']
+                'status' => $row['daily_status'],
+                'monitoring_start' => $row['monitoring_start'],
+                'monitoring_end' => $row['monitoring_end']
             ];
         }
     }
@@ -119,10 +178,13 @@ function fetchTimelineData($conn, $doctor_id){
 }
 
 function fetchMissedAlertsData($conn, $doctor_id){
+    $today = date('Y-m-d');
     $missed = $conn->query("SELECT COUNT(*) AS m
     FROM medications m
     JOIN patients p ON m.patient_id=p.id
-    WHERE p.doctor_id=$doctor_id AND m.status='missed'");
+    WHERE p.doctor_id=$doctor_id AND m.status='missed'
+      AND m.status_date='$today'
+      AND '$today' BETWEEN m.monitoring_start AND m.monitoring_end");
     $missed_count = $missed ? (int)($missed->fetch_assoc()['m'] ?? 0) : 0;
 
     $missed_medications = [];
@@ -130,6 +192,8 @@ function fetchMissedAlertsData($conn, $doctor_id){
     FROM medications m
     JOIN patients p ON m.patient_id=p.id
     WHERE p.doctor_id=$doctor_id AND m.status='missed'
+      AND m.status_date='$today'
+      AND '$today' BETWEEN m.monitoring_start AND m.monitoring_end
     ORDER BY m.time ASC");
 
     if($result){
@@ -145,12 +209,14 @@ function fetchMissedAlertsData($conn, $doctor_id){
 }
 
 if(isset($_GET['ajax']) && $_GET['ajax'] === 'missed_alerts'){
+    syncOverdueMedicationStatuses($conn, $doctor_id);
     header('Content-Type: application/json');
     echo json_encode(fetchMissedAlertsData($conn, $doctor_id));
     exit();
 }
 
 if(isset($_GET['ajax']) && $_GET['ajax'] === 'reports'){
+    syncOverdueMedicationStatuses($conn, $doctor_id);
     header('Content-Type: application/json');
     echo json_encode([
         'rows' => fetchAdherenceData($conn, $doctor_id)
@@ -159,6 +225,7 @@ if(isset($_GET['ajax']) && $_GET['ajax'] === 'reports'){
 }
 
 if(isset($_GET['ajax']) && $_GET['ajax'] === 'timeline'){
+    syncOverdueMedicationStatuses($conn, $doctor_id);
     header('Content-Type: application/json');
     echo json_encode([
         'rows' => fetchTimelineData($conn, $doctor_id)
@@ -168,8 +235,10 @@ if(isset($_GET['ajax']) && $_GET['ajax'] === 'timeline'){
 
 // Add patient
 if(isset($_POST['add_patient'])){
-    $stmt = $conn->prepare("INSERT INTO patients (doctor_id,name,phone,caregiver_phone,condition_name) VALUES (?,?,?,?,?)");
-    $stmt->bind_param("issss",$doctor_id,$_POST['patient_name'],$_POST['phone'],$_POST['caregiver_phone'],$_POST['condition_name']);
+    $age = (int)$_POST['age'];
+    $gender = trim($_POST['gender']);
+    $stmt = $conn->prepare("INSERT INTO patients (doctor_id,name,phone,caregiver_phone,condition_name,age,gender) VALUES (?,?,?,?,?,?,?)");
+    $stmt->bind_param("issssis",$doctor_id,$_POST['patient_name'],$_POST['phone'],$_POST['caregiver_phone'],$_POST['condition_name'],$age,$gender);
     $stmt->execute();
     $stmt->close();
     header("Location: dashboard.php");
@@ -192,9 +261,19 @@ if(isset($_POST['add_medication'])){
         exit();
     }
 
+    $monitoring_start = $_POST['monitoring_start'];
+    $monitoring_end = $_POST['monitoring_end'];
+
+    if($monitoring_end < $monitoring_start){
+        $_SESSION['flash_message'] = 'Monitoring end date must be on or after the monitoring start date.';
+        $_SESSION['flash_type'] = 'error';
+        header("Location: dashboard.php");
+        exit();
+    }
+
     $schedule_id = time();
-    $stmt = $conn->prepare("INSERT INTO medications (patient_id,medicine_name,dosage,time,schedule_id) VALUES (?,?,?,?,?)");
-    $stmt->bind_param("isssi",$_POST['patient_id'],$medicine['name'],$_POST['dosage'],$_POST['time'],$schedule_id);
+    $stmt = $conn->prepare("INSERT INTO medications (patient_id,medicine_name,dosage,time,monitoring_start,monitoring_end,schedule_id) VALUES (?,?,?,?,?,?,?)");
+    $stmt->bind_param("isssssi",$_POST['patient_id'],$medicine['name'],$_POST['dosage'],$_POST['time'],$monitoring_start,$monitoring_end,$schedule_id);
     $stmt->execute();
     $stmt->close();
     header("Location: dashboard.php");
@@ -202,11 +281,50 @@ if(isset($_POST['add_medication'])){
 }
 
 if(isset($_POST['send_reminders'])){
-    $reminder_url = 'http://localhost/dawa_alert/reminder.php';
-    $response_body = @file_get_contents($reminder_url);
+    $config_path = __DIR__ . '/app_config.php';
+
+    if(!file_exists($config_path)){
+        $_SESSION['flash_message'] = 'Reminder config missing. Create app_config.php and add your Africa\'s Talking sandbox API key first.';
+        $_SESSION['flash_type'] = 'error';
+        header("Location: dashboard.php");
+        exit();
+    }
+
+    $config = require $config_path;
+    $api_key = trim($config['africastalking']['api_key'] ?? '');
+    $base_url = rtrim($config['app']['base_url'] ?? 'http://localhost/dawa_alert', '/');
+    $reminder_url = $base_url . '/reminder.php';
+
+    if($api_key === '' || $api_key === 'your-africas-talking-api-key'){
+        $_SESSION['flash_message'] = 'Africa\'s Talking sandbox API key is not set in app_config.php.';
+        $_SESSION['flash_type'] = 'error';
+        header("Location: dashboard.php");
+        exit();
+    }
+
+    $response_body = false;
+    $curl_error = '';
+
+    if(function_exists('curl_init')){
+        $ch = curl_init($reminder_url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        $response_body = curl_exec($ch);
+        $curl_error = curl_error($ch);
+        $http_code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if($response_body === false || $http_code >= 400){
+            $response_body = false;
+        }
+    }
 
     if($response_body === false){
-        $_SESSION['flash_message'] = 'Reminder trigger failed. Please confirm Apache is running and reminder.php is reachable.';
+        $response_body = @file_get_contents($reminder_url);
+    }
+
+    if($response_body === false){
+        $_SESSION['flash_message'] = 'Reminder trigger failed. Confirm Apache is running, app_config.php exists, and the sandbox API key is valid.' . ($curl_error !== '' ? ' Error: ' . $curl_error : '');
         $_SESSION['flash_type'] = 'error';
     } else {
         $trimmed_response = trim($response_body);
@@ -221,6 +339,8 @@ if(isset($_POST['send_reminders'])){
 }
 
 // Fetch data
+syncOverdueMedicationStatuses($conn, $doctor_id);
+
 $patients = $conn->query("SELECT * FROM patients WHERE doctor_id=$doctor_id");
 $medicine_catalog = $conn->query("SELECT id, name, category FROM medicines ORDER BY category ASC, name ASC");
 
@@ -440,6 +560,13 @@ table tr:not(:last-child) td {
     font-weight: 500;
 }
 
+.form-hint {
+    display: block;
+    margin: -6px 0 14px;
+    color: #6681a3;
+    font-size: 13px;
+}
+
 input, select {
     width: 100%;
     padding: 10px;
@@ -502,6 +629,13 @@ button {
     font-size: 13px;
     color: #6681a3;
     margin-top: 4px;
+}
+
+.timeline-monitoring {
+    font-size: 12px;
+    color: #999;
+    margin-top: 4px;
+    font-style: italic;
 }
 
 .section-title {
@@ -762,6 +896,7 @@ function renderTimeline(data){
                     <div>
                         <div class="timeline-medication">${med.medicine_name} ${med.dosage}</div>
                         <div class="timeline-meta">Scheduled at ${med.time} <span class="status-pill ${med.status}">${med.status}</span></div>
+                        <div class="timeline-monitoring">Monitoring duration: ${med.monitoring_start} to ${med.monitoring_end}</div>
                     </div>
                     <span class="countdown"></span>
                 </li>
@@ -878,6 +1013,7 @@ async function refreshTimeline(){
 
 window.addEventListener('load', () => {
     updateLiveSchedule();
+    requestImmediateStatusRefresh();
     setInterval(updateLiveSchedule, 1000);
     setInterval(() => requestMissedAlertsRefresh(true), 15000);
     setInterval(() => requestTimelineRefresh(true), 15000);
@@ -952,13 +1088,15 @@ window.addEventListener('load', () => {
 <div id="patientsTab" style="display:none;">
 <h2>Patient List</h2>
 <table>
-<tr><th>Name</th><th>Phone</th><th>Condition</th></tr>
+<tr><th>Name</th><th>Phone</th><th>Condition</th><th>Age</th><th>Gender</th></tr>
 <?php if($patients->num_rows>0): ?>
 <?php $patients->data_seek(0); while($p=$patients->fetch_assoc()): ?>
 <tr>
 <td><?php echo $p['name']; ?></td>
 <td><?php echo $p['phone']; ?></td>
 <td><?php echo $p['condition_name']; ?></td>
+<td><?php echo $p['age'] !== null ? (int)$p['age'] : '-'; ?></td>
+<td><?php echo $p['gender'] ? htmlspecialchars($p['gender']) : '-'; ?></td>
 </tr>
 <?php endwhile; ?>
 <?php endif; ?>
@@ -971,6 +1109,12 @@ window.addEventListener('load', () => {
 <input name="phone" placeholder="Phone" required>
 <input name="caregiver_phone" placeholder="Caregiver" required>
 <input name="condition_name" placeholder="Condition" required>
+<input type="number" name="age" placeholder="Age" min="0" max="130" required>
+<select name="gender" required>
+<option value="">Select Gender</option>
+<option value="Male">Male</option>
+<option value="Female">Female</option>
+</select>
 <button name="add_patient">Add Patient</button>
 </form>
 </div>
@@ -1011,6 +1155,11 @@ while($pp=$pl->fetch_assoc()): ?>
 </select>
 <input name="dosage" placeholder="Dosage" required>
 <input type="time" name="time" required>
+<label>Monitoring Start Date:</label>
+<input type="date" name="monitoring_start" value="<?php echo date('Y-m-d'); ?>" required>
+<label>Monitoring End Date:</label>
+<input type="date" name="monitoring_end" value="<?php echo date('Y-m-d'); ?>" required>
+<small class="form-hint">Add the monitoring dates here the same way you add time and dosage. They will sync to the Timeline.</small>
 <button name="add_medication">Add Medication</button>
 </form>
 </div>
@@ -1061,6 +1210,7 @@ while($pp=$pl->fetch_assoc()): ?>
 <div>
 <div class="timeline-medication"><?php echo $m['medicine_name']; ?> <?php echo $m['dosage']; ?></div>
 <div class="timeline-meta">Scheduled at <?php echo $m['time']; ?> <span class="status-pill <?php echo $m['status']; ?>"><?php echo $m['status']; ?></span></div>
+<div class="timeline-monitoring">Monitoring duration: <?php echo $m['monitoring_start']; ?> to <?php echo $m['monitoring_end']; ?></div>
 </div>
 <span class="countdown"></span>
 </li>
