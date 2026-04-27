@@ -1,6 +1,7 @@
 <?php
 session_start();
 require 'db.php';
+require 'reminder_helpers.php';
 
 if(!isset($_SESSION['doctor_id'])){
     header("Location: login.php");
@@ -12,71 +13,6 @@ $doctor_name = $_SESSION['doctor_name'];
 $flash_message = $_SESSION['flash_message'] ?? '';
 $flash_type = $_SESSION['flash_type'] ?? 'success';
 unset($_SESSION['flash_message'], $_SESSION['flash_type']);
-
-function upsertDailyReminderLog($conn, $medication_id, $patient_id, $log_date, $status, $alert_sent, $timestamp){
-    $check = $conn->prepare("
-        SELECT id
-        FROM reminder_logs
-        WHERE medication_id = ? AND log_date = ?
-        ORDER BY id DESC
-        LIMIT 1
-    ");
-    $check->bind_param("is", $medication_id, $log_date);
-    $check->execute();
-    $existing = $check->get_result()->fetch_assoc();
-    $check->close();
-
-    if($existing){
-        $update = $conn->prepare("
-            UPDATE reminder_logs
-            SET reminder_sent_at = ?, alert_sent = ?, status = ?
-            WHERE id = ?
-        ");
-        $update->bind_param("sisi", $timestamp, $alert_sent, $status, $existing['id']);
-        $update->execute();
-        $update->close();
-        return;
-    }
-
-    $insert = $conn->prepare("
-        INSERT INTO reminder_logs (medication_id, patient_id, reminder_sent_at, log_date, alert_sent, status)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ");
-    $insert->bind_param("iissis", $medication_id, $patient_id, $timestamp, $log_date, $alert_sent, $status);
-    $insert->execute();
-    $insert->close();
-}
-
-function syncOverdueMedicationStatuses($conn, $doctor_id){
-    $today = date('Y-m-d');
-    $now = date('H:i:s');
-    $now_datetime = date('Y-m-d H:i:s');
-    $missed_grace_seconds = 15 * 60;
-
-    $sync = $conn->prepare("
-        SELECT m.id, m.patient_id
-        FROM medications m
-        JOIN patients p ON m.patient_id = p.id
-        WHERE p.doctor_id = ?
-          AND ? BETWEEN m.monitoring_start AND m.monitoring_end
-          AND TIME_TO_SEC(TIMEDIFF(?, m.time)) > ?
-          AND (m.status_date IS NULL OR m.status_date <> ? OR m.status = 'pending')
-    ");
-    $sync->bind_param("issis", $doctor_id, $today, $now, $missed_grace_seconds, $today);
-    $sync->execute();
-    $rows = $sync->get_result();
-
-    while($row = $rows->fetch_assoc()){
-        $update = $conn->prepare("UPDATE medications SET status='missed', status_date=? WHERE id=?");
-        $update->bind_param("si", $today, $row['id']);
-        $update->execute();
-        $update->close();
-
-        upsertDailyReminderLog($conn, (int)$row['id'], (int)$row['patient_id'], $today, 'missed', 1, $now_datetime);
-    }
-
-    $sync->close();
-}
 
 function fetchAdherenceData($conn, $doctor_id){
     $adherence = [];
@@ -208,6 +144,37 @@ function fetchMissedAlertsData($conn, $doctor_id){
     ];
 }
 
+function searchLocalMedicines(mysqli $conn, string $query, int $limit = 12): array
+{
+    $search = '%' . $query . '%';
+    $rows = [];
+    $stmt = $conn->prepare("
+        SELECT id, name, category
+        FROM medicines
+        WHERE name LIKE ? OR category LIKE ?
+        ORDER BY
+            CASE WHEN name LIKE ? THEN 0 ELSE 1 END,
+            name ASC
+        LIMIT ?
+    ");
+    $starts_with = $query . '%';
+    $stmt->bind_param("sssi", $search, $search, $starts_with, $limit);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    while($row = $result->fetch_assoc()){
+        $rows[] = [
+            'id' => (int)$row['id'],
+            'name' => $row['name'],
+            'category' => $row['category'] ?: 'Local Catalog',
+            'source' => 'local'
+        ];
+    }
+
+    $stmt->close();
+    return $rows;
+}
+
 if(isset($_GET['ajax']) && $_GET['ajax'] === 'missed_alerts'){
     syncOverdueMedicationStatuses($conn, $doctor_id);
     header('Content-Type: application/json');
@@ -233,6 +200,82 @@ if(isset($_GET['ajax']) && $_GET['ajax'] === 'timeline'){
     exit();
 }
 
+if(isset($_GET['ajax']) && $_GET['ajax'] === 'medicine_search'){
+    header('Content-Type: application/json');
+
+    $query = trim($_GET['q'] ?? '');
+    if($query === ''){
+        echo json_encode([
+            'rows' => []
+        ]);
+        exit();
+    }
+
+    echo json_encode([
+        'rows' => searchLocalMedicines($conn, $query, 16)
+    ]);
+    exit();
+}
+
+if(isset($_POST['add_catalog_medicine'])){
+    $medicine_name = trim($_POST['catalog_medicine_name'] ?? '');
+    $medicine_category = trim($_POST['catalog_medicine_category'] ?? '');
+
+    if($medicine_name === ''){
+        $_SESSION['flash_message'] = 'Medicine name is required.';
+        $_SESSION['flash_type'] = 'error';
+        header("Location: dashboard.php");
+        exit();
+    }
+
+    if($medicine_category === ''){
+        $medicine_category = 'General';
+    }
+
+    $stmt = $conn->prepare("
+        INSERT INTO medicines (name, category) VALUES (?, ?)
+        ON DUPLICATE KEY UPDATE category = VALUES(category)
+    ");
+    $stmt->bind_param("ss", $medicine_name, $medicine_category);
+    $stmt->execute();
+    $stmt->close();
+
+    $_SESSION['flash_message'] = 'Medicine catalog updated successfully.';
+    $_SESSION['flash_type'] = 'success';
+    header("Location: dashboard.php");
+    exit();
+}
+
+if(isset($_POST['delete_catalog_medicine'])){
+    $medicine_id = (int)($_POST['catalog_medicine_id'] ?? 0);
+
+    $usage_check = $conn->prepare("SELECT COUNT(*) AS total FROM medications WHERE medicine_name = (SELECT name FROM medicines WHERE id = ?)");
+    $usage_check->bind_param("i", $medicine_id);
+    $usage_check->execute();
+    $usage_row = $usage_check->get_result()->fetch_assoc();
+    $usage_check->close();
+
+    if((int)($usage_row['total'] ?? 0) > 0){
+        $_SESSION['flash_message'] = 'This medicine is already used in medication schedules and cannot be deleted.';
+        $_SESSION['flash_type'] = 'error';
+        header("Location: dashboard.php");
+        exit();
+    }
+
+    $delete = $conn->prepare("DELETE FROM medicines WHERE id = ?");
+    $delete->bind_param("i", $medicine_id);
+    $delete->execute();
+    $deleted_rows = $delete->affected_rows;
+    $delete->close();
+
+    $_SESSION['flash_message'] = $deleted_rows > 0
+        ? 'Medicine removed from the catalog.'
+        : 'Medicine was not found in the catalog.';
+    $_SESSION['flash_type'] = $deleted_rows > 0 ? 'success' : 'error';
+    header("Location: dashboard.php");
+    exit();
+}
+
 // Add patient
 if(isset($_POST['add_patient'])){
     $age = (int)$_POST['age'];
@@ -240,22 +283,33 @@ if(isset($_POST['add_patient'])){
     $stmt = $conn->prepare("INSERT INTO patients (doctor_id,name,phone,caregiver_phone,condition_name,age,gender) VALUES (?,?,?,?,?,?,?)");
     $stmt->bind_param("issssis",$doctor_id,$_POST['patient_name'],$_POST['phone'],$_POST['caregiver_phone'],$_POST['condition_name'],$age,$gender);
     $stmt->execute();
+    $new_patient_id = $stmt->insert_id;
     $stmt->close();
+    $_SESSION['newly_added_patient_id'] = $new_patient_id;
     header("Location: dashboard.php");
     exit();
 }
 
 // Add medication
 if(isset($_POST['add_medication'])){
-    $medicine_stmt = $conn->prepare("SELECT name FROM medicines WHERE id=? LIMIT 1");
-    $medicine_stmt->bind_param("i", $_POST['medicine_id']);
-    $medicine_stmt->execute();
-    $medicine_result = $medicine_stmt->get_result();
-    $medicine = $medicine_result->fetch_assoc();
-    $medicine_stmt->close();
+    $medicine_id = (int)($_POST['medicine_id'] ?? 0);
+    $selected_medicine_name = '';
 
-    if(!$medicine){
-        $_SESSION['flash_message'] = 'Please select a valid medicine from the database list.';
+    if($medicine_id > 0){
+        $medicine_stmt = $conn->prepare("SELECT name FROM medicines WHERE id=? LIMIT 1");
+        $medicine_stmt->bind_param("i", $medicine_id);
+        $medicine_stmt->execute();
+        $medicine_result = $medicine_stmt->get_result();
+        $medicine = $medicine_result->fetch_assoc();
+        $medicine_stmt->close();
+
+        if($medicine){
+            $selected_medicine_name = $medicine['name'];
+        }
+    }
+
+    if($selected_medicine_name === ''){
+        $_SESSION['flash_message'] = 'Select a valid medicine from your database list first.';
         $_SESSION['flash_type'] = 'error';
         header("Location: dashboard.php");
         exit();
@@ -273,7 +327,7 @@ if(isset($_POST['add_medication'])){
 
     $schedule_id = time();
     $stmt = $conn->prepare("INSERT INTO medications (patient_id,medicine_name,dosage,time,monitoring_start,monitoring_end,schedule_id) VALUES (?,?,?,?,?,?,?)");
-    $stmt->bind_param("isssssi",$_POST['patient_id'],$medicine['name'],$_POST['dosage'],$_POST['time'],$monitoring_start,$monitoring_end,$schedule_id);
+    $stmt->bind_param("isssssi",$_POST['patient_id'],$selected_medicine_name,$_POST['dosage'],$_POST['time'],$monitoring_start,$monitoring_end,$schedule_id);
     $stmt->execute();
     $stmt->close();
     header("Location: dashboard.php");
@@ -343,6 +397,7 @@ syncOverdueMedicationStatuses($conn, $doctor_id);
 
 $patients = $conn->query("SELECT * FROM patients WHERE doctor_id=$doctor_id");
 $medicine_catalog = $conn->query("SELECT id, name, category FROM medicines ORDER BY category ASC, name ASC");
+$medicine_management = $conn->query("SELECT id, name, category, created_at FROM medicines ORDER BY category ASC, name ASC");
 
 $medications = $conn->query("SELECT m.*,p.name AS patient_name 
 FROM medications m 
@@ -560,6 +615,26 @@ table tr:not(:last-child) td {
     font-weight: 500;
 }
 
+.inline-form {
+    display: inline;
+}
+
+.catalog-grid {
+    display: grid;
+    grid-template-columns: minmax(260px, 380px) 1fr;
+    gap: 24px;
+    align-items: start;
+}
+
+.catalog-meta {
+    color: #6681a3;
+    font-size: 13px;
+}
+
+.danger-button {
+    background: #c94d4d;
+}
+
 .form-hint {
     display: block;
     margin: -6px 0 14px;
@@ -678,7 +753,7 @@ button {
 
 <script>
 function showTab(id){
-['dashboardTab','patientsTab','medicationsTab','timelineTab','reportsTab','missedTab']
+['dashboardTab','patientsTab','medicationsTab','catalogTab','timelineTab','reportsTab','missedTab']
 .forEach(t=>document.getElementById(t).style.display=(t===id?'block':'none'));
 }
 
@@ -1032,6 +1107,7 @@ window.addEventListener('load', () => {
 <a onclick="showTab('dashboardTab')">Dashboard</a>
 <a onclick="showTab('patientsTab')">Patients</a>
 <a onclick="showTab('medicationsTab')">Medications</a>
+<a onclick="showTab('catalogTab')">Medicine Catalog</a>
 <a onclick="showTab('timelineTab')">Timeline</a>
 <a onclick="showTab('reportsTab')">Reports</a>
 <a id="missedAlertsLink" onclick="showTab('missedTab')">Missed Alerts<?php echo $missed_count > 0 ? " ($missed_count)" : ""; ?></a>
@@ -1128,10 +1204,14 @@ window.addEventListener('load', () => {
 <select name="patient_id" required>
 <option value="">Select Patient</option>
 <?php 
+$newly_added_patient_id = $_SESSION['newly_added_patient_id'] ?? null;
 $pl=$conn->query("SELECT * FROM patients WHERE doctor_id=$doctor_id");
-while($pp=$pl->fetch_assoc()): ?>
-<option value="<?php echo $pp['id']; ?>"><?php echo $pp['name']; ?></option>
+while($pp=$pl->fetch_assoc()): 
+    $is_selected = $newly_added_patient_id && $pp['id'] == $newly_added_patient_id ? 'selected' : '';
+?>
+<option value="<?php echo $pp['id']; ?>" <?php echo $is_selected; ?>><?php echo $pp['name']; ?></option>
 <?php endwhile; ?>
+<?php unset($_SESSION['newly_added_patient_id']); ?>
 </select>
 
 <select name="medicine_id" required>
@@ -1159,9 +1239,53 @@ while($pp=$pl->fetch_assoc()): ?>
 <input type="date" name="monitoring_start" value="<?php echo date('Y-m-d'); ?>" required>
 <label>Monitoring End Date:</label>
 <input type="date" name="monitoring_end" value="<?php echo date('Y-m-d'); ?>" required>
-<small class="form-hint">Add the monitoring dates here the same way you add time and dosage. They will sync to the Timeline.</small>
 <button name="add_medication">Add Medication</button>
 </form>
+</div>
+</div>
+
+<!-- CATALOG -->
+<div id="catalogTab" style="display:none;">
+<div class="section-title">
+<h2>Medicine Catalog</h2>
+<small>Manage the medicines stored in your database.</small>
+</div>
+
+<div class="catalog-grid">
+<div class="form-section" style="margin-top:0;">
+<h3>Add Or Update Medicine</h3>
+<form method="POST">
+<input name="catalog_medicine_name" placeholder="Medicine Name" required>
+<input name="catalog_medicine_category" placeholder="Category" value="General" required>
+<button name="add_catalog_medicine">Save Medicine</button>
+</form>
+</div>
+
+<div class="form-section" style="margin-top:0;">
+<h3>Catalog List</h3>
+<table>
+<tr><th>Name</th><th>Category</th><th>Added</th><th>Action</th></tr>
+<?php if($medicine_management && $medicine_management->num_rows > 0): ?>
+<?php while($medicine_row = $medicine_management->fetch_assoc()): ?>
+<tr>
+<td><?php echo htmlspecialchars($medicine_row['name']); ?></td>
+<td><?php echo htmlspecialchars($medicine_row['category']); ?></td>
+<td class="catalog-meta"><?php echo htmlspecialchars($medicine_row['created_at']); ?></td>
+<td>
+<form method="POST" class="inline-form" onsubmit="return confirm('Delete this medicine from the catalog?');">
+<input type="hidden" name="catalog_medicine_id" value="<?php echo (int)$medicine_row['id']; ?>">
+<button type="submit" name="delete_catalog_medicine" class="danger-button">Delete</button>
+</form>
+</td>
+</tr>
+<?php endwhile; ?>
+<?php else: ?>
+<tr>
+<td colspan="4">No medicines are stored in the catalog yet.</td>
+</tr>
+<?php endif; ?>
+</table>
+</div>
 </div>
 </div>
 
@@ -1196,7 +1320,6 @@ while($pp=$pl->fetch_assoc()): ?>
 <div id="timelineTab" style="display:none;">
 <div class="section-title">
 <h2>Timeline</h2>
-<small>Live countdowns update every second and status changes sync automatically</small>
 </div>
 <div id="timelineContent">
 <?php foreach($timeline as $patient=>$slots): ?>
