@@ -381,10 +381,7 @@ if(isset($_POST['send_reminders'])){
         $_SESSION['flash_message'] = 'Reminder trigger failed. Confirm Apache is running, app_config.php exists, and the sandbox API key is valid.' . ($curl_error !== '' ? ' Error: ' . $curl_error : '');
         $_SESSION['flash_type'] = 'error';
     } else {
-        $trimmed_response = trim($response_body);
-        $_SESSION['flash_message'] = $trimmed_response !== ''
-            ? "Reminder job completed: $trimmed_response"
-            : 'Reminder job completed.';
+        $_SESSION['flash_message'] = 'Reminder send successful';
         $_SESSION['flash_type'] = 'success';
     }
 
