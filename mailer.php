@@ -4,7 +4,15 @@ use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\SMTP;
 use PHPMailer\PHPMailer\Exception;
 
-require __DIR__ . "/vendor/autoload.php";
+$autoload_path = __DIR__ . "/vendor/autoload.php";
+
+if (!file_exists($autoload_path)) {
+    throw new RuntimeException(
+        'PHPMailer is not installed. Run "composer install" in the project folder to create vendor/autoload.php.'
+    );
+}
+
+require $autoload_path;
 $config = require __DIR__ . "/app_config.php";
 $mail_config = $config['mail'];
 

@@ -2,6 +2,7 @@
 
 require 'db.php';
 $config = require __DIR__ . '/app_config.php';
+$message = '';
 
 $email = trim($_POST["email"] ?? "");
 
@@ -30,29 +31,28 @@ if ($conn->affected_rows) {
 
     $base_url = rtrim($config['app']['base_url'], '/');
     $reset_link = $base_url . '/reset-password.php?token=' . urlencode($token);
-
-    $mail = require __DIR__ . "/mailer.php";
-
-    $mail->setFrom($config['mail']['from_email'], $config['mail']['from_name']);
-    $mail->addAddress($email);
-    $mail->Subject = "Password Reset";
-    $mail->Body = <<<END
-
-    Click <a href="$reset_link">here</a>
-    to reset your password.
-
-    END;
-
     try {
+        $mail = require __DIR__ . "/mailer.php";
+        $mail->setFrom($config['mail']['from_email'], $config['mail']['from_name']);
+        $mail->addAddress($email);
+        $mail->Subject = "Password Reset";
+        $mail->Body = <<<END
+
+        Click <a href="$reset_link">here</a>
+        to reset your password.
+
+        END;
 
         $mail->send();
+        $message = "Message sent, please check your inbox.";
 
-    } catch (Exception $e) {
-
-        echo "Message could not be sent. Mailer error: {$mail->ErrorInfo}";
+    } catch (Throwable $e) {
+        $message = "Password reset email could not be sent. " . $e->getMessage();
 
     }
 
+} else {
+    $message = "If that email is registered, a password reset link has been prepared.";
 }
 
-echo "Message sent, please check your inbox.";
+echo $message;

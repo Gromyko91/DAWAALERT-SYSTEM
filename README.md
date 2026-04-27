@@ -30,6 +30,7 @@ Dawa Alert System is a PHP and MySQL medication reminder dashboard for doctors. 
 - `db.php` - database connection
 - `mailer.php` - SMTP mail setup
 - `seed_medicines.php` - seeds medicine catalog
+- `medicine_catalog.php` - shared medicine catalog used for seeding
 - `app_config.example.php` - example configuration template
 
 ## Requirements
@@ -81,15 +82,14 @@ Default local values in this project are:
 - password: empty
 - database: `dawa_alert`
 
-3. Create the required tables:
+3. The app now creates and updates the required tables automatically through `db.php`.
+   It also records applied schema changes in the `schema_migrations` table.
 
 - `doctors`
 - `patients`
 - `medications`
 - `reminder_logs`
 - `medicines`
-
-If you already used the app locally, some tables may already exist.
 
 ## App Configuration
 
@@ -171,11 +171,19 @@ https://your-public-tunnel-url/reminder.php
 
 ## Seed The Medicine Catalog
 
-To load the medicine catalog into the database:
+To force-load the medicine catalog into the database:
 
 ```powershell
 php seed_medicines.php
 ```
+
+## Medicine Catalog Management
+
+Logged-in users can now manage the medicine catalog directly from the dashboard:
+
+- open the `Medicine Catalog` tab
+- add or update a medicine name and category
+- delete medicines that are not yet used in medication schedules
 
 ## Open The App
 
@@ -215,9 +223,8 @@ php reminder.php
 
 ## Current Limitations
 
-- no migration system yet
-- no admin UI for managing the medicine catalog
-- simple SMS reply matching can be ambiguous if one patient has multiple pending reminders close together
+- there is no role-based admin account yet, so catalog management is available to logged-in users
+- simple SMS reply matching still falls back to the latest pending reminder if a reply code is missing
 
 ## Repository
 
